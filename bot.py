@@ -1,11 +1,9 @@
+# bot.py — Habibi BanBot v2 | UI + Speed Overhaul
 import asyncio
 import logging
 from pyrogram import Client, filters
-from pyrogram.types import Message, ChatPermissions
-from pyrogram.errors import (
-    FloodWait, UserAdminInvalid, ChatAdminRequired,
-    UserNotParticipant, RPCError
-)
+from pyrogram.types import Message, ChatPermissions, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import FloodWait, UserAdminInvalid, ChatAdminRequired, RPCError
 from config import API_ID, API_HASH, BOT_TOKEN, SUDO_USERS
 
 logging.basicConfig(level=logging.INFO)
@@ -18,170 +16,339 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
-def is_sudo(user_id: int) -> bool:
-    return user_id in SUDO_USERS
+# ─────────────────────────────────────────
+#  HELPERS
+# ─────────────────────────────────────────
 
-async def ban_member(client: Client, chat_id: int, user_id: int) -> bool:
-    try:
-        await client.ban_chat_member(chat_id, user_id)
-        return True
-    except FloodWait as e:
-        logger.warning(f"FloodWait: sleeping {e.value}s")
-        await asyncio.sleep(e.value)
-        return await ban_member(client, chat_id, user_id)
-    except (UserAdminInvalid, ChatAdminRequired):
-        return False
-    except RPCError as e:
-        logger.error(f"RPCError banning {user_id}: {e}")
-        return False
+def is_sudo(uid: int) -> bool:
+    return uid in SUDO_USERS
 
-@app.on_message(filters.command("banall") & filters.group)
-async def banall_handler(client: Client, message: Message):
-    if not is_sudo(message.from_user.id):
-        await message.reply("❌ Tu sudo nahi hai bhai.")
-        return
+def progress_bar(done: int, total: int, length: int = 12) -> str:
+    if total == 0:
+        return "░" * length
+    filled = int(length * done / total)
+    return "█" * filled + "░" * (length - filled)
 
-    chat_id = message.chat.id
-
-    # Check bot admin status
-    bot_member = await client.get_chat_member(chat_id, "me")
-    if not bot_member.privileges or not bot_member.privileges.can_restrict_members:
-        await message.reply("❌ Mujhe ban permission chahiye pehle.")
-        return
-
-    status_msg = await message.reply("⚡ Ban-All shuru ho raha hai... sab gaye!")
-
-    banned = 0
-    failed = 0
-    skipped = 0
-
-    async for member in client.get_chat_members(chat_id):
-        user_id = member.user.id
-
-        # Skip bots, sudo users, and the bot itself
-        if member.user.is_bot:
-            skipped += 1
-            continue
-        if user_id in SUDO_USERS:
-            skipped += 1
-            continue
-        if member.status in ("administrator", "creator"):
-            skipped += 1
-            continue
-
-        success = await ban_member(client, chat_id, user_id)
-        if success:
-            banned += 1
-        else:
-            failed += 1
-
-        # Progress update har 20 ban pe
-        if (banned + failed) % 20 == 0:
-            try:
-                await status_msg.edit(
-                    f"⚡ Progress: {banned} banned | {failed} failed | {skipped} skipped"
-                )
-            except Exception:
-                pass
-
-        await asyncio.sleep(0.05)  # Rate limit se bachne ke liye
-
-    await status_msg.edit(
-        f"✅ **Ban-All Complete!**\n"
-        f"├ Banned: `{banned}`\n"
-        f"├ Failed: `{failed}`\n"
-        f"└ Skipped: `{skipped}` (admins/bots/sudo)"
-    )
-
-@app.on_message(filters.command("unbanall") & filters.group)
-async def unbanall_handler(client: Client, message: Message):
-    if not is_sudo(message.from_user.id):
-        await message.reply("❌ Tu sudo nahi hai bhai.")
-        return
-
-    chat_id = message.chat.id
-    status_msg = await message.reply("🔓 Unban-All shuru...")
-
-    unbanned = 0
-    failed = 0
-
-    async for member in client.get_chat_members(chat_id, filter="banned"):
-        user_id = member.user.id
+async def safe_ban(client: Client, chat_id: int, user_id: int) -> bool:
+    for attempt in range(3):
         try:
-            await client.unban_chat_member(chat_id, user_id)
-            unbanned += 1
+            await client.ban_chat_member(chat_id, user_id)
+            return True
         except FloodWait as e:
             await asyncio.sleep(e.value)
-            try:
-                await client.unban_chat_member(chat_id, user_id)
-                unbanned += 1
-            except Exception:
-                failed += 1
-        except Exception:
-            failed += 1
+        except (UserAdminInvalid, ChatAdminRequired):
+            return False
+        except RPCError:
+            await asyncio.sleep(0.3 * (attempt + 1))
+    return False
 
-        await asyncio.sleep(0.05)
+async def safe_unban(client: Client, chat_id: int, user_id: int) -> bool:
+    for attempt in range(3):
+        try:
+            await client.unban_chat_member(chat_id, user_id)
+            return True
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+        except RPCError:
+            await asyncio.sleep(0.3 * (attempt + 1))
+    return False
 
-    await status_msg.edit(
-        f"✅ **Unban-All Complete!**\n"
-        f"├ Unbanned: `{unbanned}`\n"
-        f"└ Failed: `{failed}`"
-    )
-
-@app.on_message(filters.command("muteall") & filters.group)
-async def muteall_handler(client: Client, message: Message):
-    if not is_sudo(message.from_user.id):
-        await message.reply("❌ Tu sudo nahi hai.")
-        return
-
-    chat_id = message.chat.id
-    status_msg = await message.reply("🔇 Mute-All shuru...")
-
-    muted = 0
-    failed = 0
-
+async def safe_mute(client: Client, chat_id: int, user_id: int) -> bool:
     mute_perms = ChatPermissions(
         can_send_messages=False,
         can_send_media_messages=False,
         can_send_polls=False,
         can_send_other_messages=False,
-        can_add_web_page_previews=False
+        can_add_web_page_previews=False,
+        can_invite_users=False
     )
-
-    async for member in client.get_chat_members(chat_id):
-        user_id = member.user.id
-        if member.user.is_bot or user_id in SUDO_USERS:
-            continue
-        if member.status in ("administrator", "creator"):
-            continue
-
+    for attempt in range(3):
         try:
             await client.restrict_chat_member(chat_id, user_id, mute_perms)
-            muted += 1
+            return True
         except FloodWait as e:
             await asyncio.sleep(e.value)
-        except Exception:
+        except RPCError:
+            await asyncio.sleep(0.3 * (attempt + 1))
+    return False
+
+# ─────────────────────────────────────────
+#  CORE ENGINE — CONCURRENT BATCH PROCESSOR
+# ─────────────────────────────────────────
+
+async def batch_action(
+    client: Client,
+    chat_id: int,
+    user_ids: list,
+    action_fn,
+    status_msg: Message,
+    action_name: str,
+    emoji: str
+):
+    total = len(user_ids)
+    done = 0
+    success = 0
+    failed = 0
+
+    # Concurrent workers — 8 parallel bans at once
+    BATCH_SIZE = 8
+    UPDATE_EVERY = 15
+
+    async def worker(uid):
+        nonlocal done, success, failed
+        result = await action_fn(client, chat_id, uid)
+        done += 1
+        if result:
+            success += 1
+        else:
             failed += 1
 
-        await asyncio.sleep(0.05)
+    for i in range(0, total, BATCH_SIZE):
+        batch = user_ids[i:i + BATCH_SIZE]
+        await asyncio.gather(*[worker(uid) for uid in batch])
 
-    await status_msg.edit(
-        f"✅ **Mute-All Complete!**\n"
-        f"├ Muted: `{muted}`\n"
-        f"└ Failed: `{failed}`"
+        # Update UI every UPDATE_EVERY members
+        if done % UPDATE_EVERY < BATCH_SIZE or done >= total:
+            bar = progress_bar(done, total)
+            pct = int(100 * done / total) if total else 100
+            try:
+                await status_msg.edit(
+                    f"{emoji} **{action_name} — Running**\n"
+                    f"┌ Progress : `{bar}` {pct}%\n"
+                    f"├ ✅ Success : `{success}`\n"
+                    f"├ ❌ Failed  : `{failed}`\n"
+                    f"└ 📊 Total   : `{done}/{total}`"
+                )
+            except Exception:
+                pass
+
+        # Small breathe between batches — Telegram rate limit se bachao
+        await asyncio.sleep(0.08)
+
+    return success, failed
+
+# ─────────────────────────────────────────
+#  MEMBER COLLECTOR
+# ─────────────────────────────────────────
+
+async def collect_members(client: Client, chat_id: int, include_admins: bool = False) -> list:
+    members = []
+    async for m in client.get_chat_members(chat_id):
+        if m.user.is_bot:
+            continue
+        if m.user.id in SUDO_USERS:
+            continue
+        if not include_admins and m.status in ("administrator", "creator"):
+            continue
+        members.append(m.user.id)
+    return members
+
+async def collect_banned(client: Client, chat_id: int) -> list:
+    members = []
+    async for m in client.get_chat_members(chat_id, filter="banned"):
+        members.append(m.user.id)
+    return members
+
+# ─────────────────────────────────────────
+#  COMMANDS
+# ─────────────────────────────────────────
+
+@app.on_message(filters.command("banall") & filters.group)
+async def banall_cmd(client: Client, message: Message):
+    if not is_sudo(message.from_user.id):
+        return await message.reply("🚫 **Access Denied** — Tu sudo nahi hai.")
+
+    bot_me = await client.get_chat_member(message.chat.id, "me")
+    if not getattr(bot_me.privileges, "can_restrict_members", False):
+        return await message.reply("⚠️ **Permission Missing** — Mujhe ban rights chahiye.")
+
+    status = await message.reply(
+        "⚡ **BAN-ALL INITIATED**\n"
+        "└ Members collect ho rahe hain..."
     )
 
-@app.on_message(filters.command("start") & filters.private)
-async def start_handler(client: Client, message: Message):
+    user_ids = await collect_members(client, message.chat.id)
+
+    if not user_ids:
+        return await status.edit("✅ Koi bannable member nahi mila.")
+
+    s, f = await batch_action(
+        client, message.chat.id, user_ids,
+        safe_ban, status, "BAN-ALL", "🔨"
+    )
+
+    await status.edit(
+        f"🔨 **BAN-ALL — COMPLETE**\n"
+        f"┌ ✅ Banned  : `{s}`\n"
+        f"├ ❌ Failed  : `{f}`\n"
+        f"└ 👥 Total   : `{s + f}`\n\n"
+        f"_Executed by_ {message.from_user.mention}"
+    )
+
+@app.on_message(filters.command("unbanall") & filters.group)
+async def unbanall_cmd(client: Client, message: Message):
+    if not is_sudo(message.from_user.id):
+        return await message.reply("🚫 **Access Denied**")
+
+    status = await message.reply(
+        "🔓 **UNBAN-ALL INITIATED**\n"
+        "└ Banned list fetch ho rahi hai..."
+    )
+
+    user_ids = await collect_banned(client, message.chat.id)
+
+    if not user_ids:
+        return await status.edit("✅ Koi banned member nahi hai.")
+
+    s, f = await batch_action(
+        client, message.chat.id, user_ids,
+        safe_unban, status, "UNBAN-ALL", "🔓"
+    )
+
+    await status.edit(
+        f"🔓 **UNBAN-ALL — COMPLETE**\n"
+        f"┌ ✅ Unbanned : `{s}`\n"
+        f"├ ❌ Failed   : `{f}`\n"
+        f"└ 👥 Total    : `{s + f}`\n\n"
+        f"_Executed by_ {message.from_user.mention}"
+    )
+
+@app.on_message(filters.command("muteall") & filters.group)
+async def muteall_cmd(client: Client, message: Message):
+    if not is_sudo(message.from_user.id):
+        return await message.reply("🚫 **Access Denied**")
+
+    status = await message.reply(
+        "🔇 **MUTE-ALL INITIATED**\n"
+        "└ Members collect ho rahe hain..."
+    )
+
+    user_ids = await collect_members(client, message.chat.id)
+
+    if not user_ids:
+        return await status.edit("✅ Koi muteable member nahi mila.")
+
+    s, f = await batch_action(
+        client, message.chat.id, user_ids,
+        safe_mute, status, "MUTE-ALL", "🔇"
+    )
+
+    await status.edit(
+        f"🔇 **MUTE-ALL — COMPLETE**\n"
+        f"┌ ✅ Muted  : `{s}`\n"
+        f"├ ❌ Failed : `{f}`\n"
+        f"└ 👥 Total  : `{s + f}`\n\n"
+        f"_Executed by_ {message.from_user.mention}"
+    )
+
+@app.on_message(filters.command("kickall") & filters.group)
+async def kickall_cmd(client: Client, message: Message):
+    if not is_sudo(message.from_user.id):
+        return await message.reply("🚫 **Access Denied**")
+
+    async def safe_kick(client, chat_id, uid):
+        try:
+            await client.ban_chat_member(chat_id, uid)
+            await asyncio.sleep(0.1)
+            await client.unban_chat_member(chat_id, uid)
+            return True
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+            return False
+        except Exception:
+            return False
+
+    status = await message.reply(
+        "👟 **KICK-ALL INITIATED**\n"
+        "└ Members collect ho rahe hain..."
+    )
+
+    user_ids = await collect_members(client, message.chat.id)
+
+    if not user_ids:
+        return await status.edit("✅ Koi kickable member nahi mila.")
+
+    s, f = await batch_action(
+        client, message.chat.id, user_ids,
+        safe_kick, status, "KICK-ALL", "👟"
+    )
+
+    await status.edit(
+        f"👟 **KICK-ALL — COMPLETE**\n"
+        f"┌ ✅ Kicked : `{s}`\n"
+        f"├ ❌ Failed : `{f}`\n"
+        f"└ 👥 Total  : `{s + f}`\n\n"
+        f"_Executed by_ {message.from_user.mention}"
+    )
+
+@app.on_message(filters.command("stats") & filters.group)
+async def stats_cmd(client: Client, message: Message):
+    chat = await client.get_chat(message.chat.id)
+    total = chat.members_count
+
+    admins = 0
+    async for m in client.get_chat_members(message.chat.id, filter="administrators"):
+        admins += 1
+
+    bots = 0
+    async for m in client.get_chat_members(message.chat.id):
+        if m.user.is_bot:
+            bots += 1
+
     await message.reply(
-        "⚡ **Ban-All Bot — VPS Ready**\n\n"
-        "Commands:\n"
-        "`/banall` — Sab members ko ban karo\n"
-        "`/unbanall` — Sab ko unban karo\n"
-        "`/muteall` — Sab ko mute karo\n\n"
-        "Bot ko group admin + ban permission chahiye."
+        f"📊 **Group Stats — {chat.title}**\n"
+        f"┌ 👥 Total Members : `{total}`\n"
+        f"├ 🛡️ Admins        : `{admins}`\n"
+        f"├ 🤖 Bots          : `{bots}`\n"
+        f"└ 👤 Users         : `{total - admins - bots}`"
     )
+
+@app.on_message(filters.command("start"))
+async def start_cmd(client: Client, message: Message):
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔨 Ban-All", callback_data="info_ban"),
+            InlineKeyboardButton("🔓 Unban-All", callback_data="info_unban")
+        ],
+        [
+            InlineKeyboardButton("🔇 Mute-All", callback_data="info_mute"),
+            InlineKeyboardButton("👟 Kick-All", callback_data="info_kick")
+        ],
+        [
+            InlineKeyboardButton("📊 Stats", callback_data="info_stats")
+        ]
+    ])
+
+    await message.reply(
+        "⚡ **Habibi BanBot v2**\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "Sabse tagada, sabse tez, sabse powerful.\n\n"
+        "**Commands:**\n"
+        "`/banall` — Sab ko ban karo\n"
+        "`/unbanall` — Sab ko unban karo\n"
+        "`/muteall` — Sab ko mute karo\n"
+        "`/kickall` — Sab ko kick karo\n"
+        "`/stats` — Group stats dekho\n\n"
+        "━━━━━━━━━━━━━━━━━━\n"
+        "_Bot ko Admin + Ban Permission chahiye group mein._",
+        reply_markup=keyboard
+    )
+
+@app.on_callback_query()
+async def callback_handler(client, query):
+    info = {
+        "info_ban": "🔨 **/banall** — Group ke sabhi members ko ek jhatke mein ban karta hai. Admins + Sudo users safe rehte hain.",
+        "info_unban": "🔓 **/unbanall** — Sare banned members ko unban karta hai ek saath.",
+        "info_mute": "🔇 **/muteall** — Sabko message bhejne se rok deta hai. Admins safe.",
+        "info_kick": "👟 **/kickall** — Sabko kick karta hai (ban + unban = rejoining allowed).",
+        "info_stats": "📊 **/stats** — Group mein total members, admins, bots ka breakdown.",
+    }
+    await query.answer(info.get(query.data, "—"), show_alert=True)
+
+# ─────────────────────────────────────────
+#  LAUNCH
+# ─────────────────────────────────────────
 
 if __name__ == "__main__":
-    logger.info("Bot live ho gaya, baby. 6767.")
+    logger.info("⚡ Habibi BanBot v2 — Live on VPS. 6767.")
     app.run()
